@@ -194,12 +194,19 @@ SelectionResult Fabric::Impl::evaluateLocked(const ConsumerRequirements& req) {
     std::vector<CandidateAssessment> rejected;
     bool anyRevalidation = false;
 
+    const PoolRecord* pool = nullptr;
+    if (!req.preferredPool.null()) {
+        auto pit = pools.find(req.preferredPool);
+        if (pit != pools.end()) pool = &pit->second;
+    }
     for (const auto& [rid, rr] : regions) {
         if (!req.preferredPool.null()) {
+            // Pool membership is a view: only the pool's current members, at
+            // the region's current generation, are candidates.
             bool member = false;
-            for (const auto& [pid, pgen] : rr.poolMemberships) {
-                (void)pgen;
-                if (pid == req.preferredPool) { member = true; break; }
+            if (pool) {
+                for (const auto& m : pool->descriptor.members)
+                    if (m.region == rid && m.generation == rr.descriptor.generation) { member = true; break; }
             }
             if (!member) continue;
         }

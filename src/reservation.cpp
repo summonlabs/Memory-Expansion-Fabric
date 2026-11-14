@@ -171,6 +171,10 @@ Result<void> Fabric::releaseReservation(const ReservationId& id, const Authority
         res.state != ReservationState::COMMITTED &&
         res.state != ReservationState::ACTIVE)
         return Result<void>::fail(ErrorCode::INVALID_STATE_TRANSITION, "not releasable");
+    // Only the holder releases, as only the holder commits: a worker
+    // reservation by that worker incarnation, an operator one by the operator.
+    if (a.worker != res.worker || a.boot != res.boot)
+        return Result<void>::fail(ErrorCode::STALE_AUTHORITY, "release by a non-holder");
 
     auto rgit = impl_->regions.find(res.region);
     if (rgit == impl_->regions.end())

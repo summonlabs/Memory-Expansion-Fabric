@@ -185,6 +185,31 @@ bool Fabric::Impl::fence(Fabric::Impl& st, Reservation& r, const char* reason) {
     return true;
 }
 
+void Fabric::Impl::fenceIncarnationLocked(const WorkerId& w, const WorkerBootId& boot,
+                                          const char* reason) {
+    std::vector<RegionId> workerRegions;
+    for (auto& [rid, rr] : regions) {
+        if (rr.hasEvidence && rr.latest.header.worker == w &&
+            rr.latest.header.boot == boot) {
+            rr.evidenceStatus = EvidenceStatus::REVALIDATION_REQUIRED;
+            if (rr.lifecycle != RegionLifecycle::RETIRED &&
+                rr.lifecycle != RegionLifecycle::DRAINING &&
+                rr.lifecycle != RegionLifecycle::UNAVAILABLE)
+                rr.lifecycle = RegionLifecycle::REVALIDATION_REQUIRED;
+            workerRegions.push_back(rid);
+        }
+    }
+    for (auto& [rid, rrec] : reservations) {
+        (void)rid;
+        bool byWorker = rrec.value.worker == w && rrec.value.boot == boot;
+        bool byRegion = false;
+        for (auto r : workerRegions)
+            if (rrec.value.region == r) { byRegion = true; break; }
+        if (byWorker || byRegion)
+            fence(*this, rrec.value, reason);
+    }
+}
+
 // ---------------------------------------------------------------------------
 // Construction / destruction / move.
 // ---------------------------------------------------------------------------
@@ -370,6 +395,19 @@ Result<PoolId> Fabric::registerPool(const PoolDescriptor& d, const Authority& a)
         return Result<PoolId>::fail(ErrorCode::STALE_AUTHORITY, "stale authority");
     if (d.id.null() || d.generation.null())
         return Result<PoolId>::fail(ErrorCode::INVALID_ID, "null pool id/generation");
+    // Members obey addPoolMember's rules: a registered region at its current
+    // generation, at most once.
+    for (std::size_t i = 0; i < d.members.size(); ++i) {
+        const PoolMember& m = d.members[i];
+        auto rit = impl_->regions.find(m.region);
+        if (rit == impl_->regions.end())
+            return Result<PoolId>::fail(ErrorCode::NOT_FOUND, "member region not found");
+        if (m.generation.null() || rit->second.descriptor.generation != m.generation)
+            return Result<PoolId>::fail(ErrorCode::WRONG_GENERATION, "member generation mismatch");
+        for (std::size_t j = 0; j < i; ++j)
+            if (d.members[j].region == m.region)
+                return Result<PoolId>::fail(ErrorCode::DUPLICATE_ID, "duplicate pool member");
+    }
     auto it = impl_->pools.find(d.id);
     if (it != impl_->pools.end()) {
         if (it->second.descriptor.generation == d.generation)
@@ -426,18 +464,16 @@ Result<void> Fabric::addPoolMember(const PoolId& pool, const PoolMember& m, cons
     if (rit->second.descriptor.generation != m.generation)
         return Result<void>::fail(ErrorCode::WRONG_GENERATION, "member generation mismatch");
     auto& members = pit->second.descriptor.members;
-    for (const auto& mem : members) {
+    for (auto& mem : members) {
         if (mem.region == m.region) {
             if (mem.generation == m.generation)
                 return Result<void>::fail(ErrorCode::ALREADY_EXISTS, "member already present");
-            // replace with newer generation
-            pit->second.descriptor.members.push_back(m);
+            // Replace the member's generation in place: one entry per region.
+            mem.generation = m.generation;
             return Result<void>::success();
         }
     }
     members.push_back(m);
-    // record membership on region for reverse lookup (pool generation)
-    rit->second.poolMemberships.push_back({pool, pit->second.descriptor.generation});
     return Result<void>::success();
 }
 
@@ -455,12 +491,6 @@ Result<void> Fabric::removePoolMember(const PoolId& pool, const RegionId& region
                   members.end());
     if (members.size() == oldSize)
         return Result<void>::fail(ErrorCode::NOT_FOUND, "member not in pool");
-    auto rit = impl_->regions.find(region);
-    if (rit != impl_->regions.end()) {
-        auto& pm = rit->second.poolMemberships;
-        pm.erase(std::remove_if(pm.begin(), pm.end(),
-                                [&](const auto& pr){ return pr.first == pool; }), pm.end());
-    }
     return Result<void>::success();
 }
 
@@ -735,13 +765,22 @@ Result<void> Fabric::registerWorker(const WorkerId& w, const WorkerBootId& boot,
     if (!a.worker.null() && (a.worker != w || a.boot != boot))
         return Result<void>::fail(ErrorCode::STALE_AUTHORITY, "worker authority mismatch");
     auto it = impl_->workers.find(w);
-    if (it != impl_->workers.end()) {
-        // A boot id is bound to one incarnation. Whether alive or dead, a
-        // previously seen boot must never be re-admitted as fresh authority.
-        if (it->second.boot == boot)
-            return Result<void>::fail(ErrorCode::ALREADY_EXISTS, "worker boot already used");
-    }
     WorkerRecord rec;
+    if (it != impl_->workers.end()) {
+        // A boot id is bound to one incarnation. Whether alive, dead or
+        // superseded, a previously seen boot must never be re-admitted as
+        // fresh authority.
+        const auto& prior = it->second.priorBoots;
+        if (it->second.boot == boot || std::find(prior.begin(), prior.end(), boot) != prior.end())
+            return Result<void>::fail(ErrorCode::ALREADY_EXISTS, "worker boot already used");
+        // The new boot supersedes a live incarnation: its evidence and
+        // reservations lose their authority now (a dead one was fenced when
+        // it died).
+        if (it->second.alive)
+            impl_->fenceIncarnationLocked(w, it->second.boot, "worker boot superseded");
+        rec.priorBoots = std::move(it->second.priorBoots);
+        rec.priorBoots.push_back(it->second.boot);
+    }
     rec.boot = boot;
     rec.registeredEpoch = epoch;
     rec.pid = pid;
@@ -764,28 +803,9 @@ Result<void> Fabric::markWorkerDead(const WorkerId& w, const Authority& a) {
     it->second.lastSeenMs = nowMs();
     // Fence dynamic evidence owned by this worker, and every reservation
     // whose backing-region authority came from this worker (worker-bound
-    // reservations are fenced too).
-    std::vector<RegionId> workerRegions;
-    for (auto& [rid, rr] : impl_->regions) {
-        if (rr.hasEvidence && rr.latest.header.worker == w &&
-            rr.latest.header.boot == boot) {
-            rr.evidenceStatus = EvidenceStatus::REVALIDATION_REQUIRED;
-            if (rr.lifecycle != RegionLifecycle::RETIRED &&
-                rr.lifecycle != RegionLifecycle::DRAINING &&
-                rr.lifecycle != RegionLifecycle::UNAVAILABLE)
-                rr.lifecycle = RegionLifecycle::REVALIDATION_REQUIRED;
-            workerRegions.push_back(rid);
-        }
-    }
-    for (auto& [rid, rrec] : impl_->reservations) {
-        (void)rid;
-        bool byWorker = rrec.value.worker == w;
-        bool byRegion = false;
-        for (auto r : workerRegions)
-            if (rrec.value.region == r) { byRegion = true; break; }
-        if (byWorker || byRegion)
-            Impl::fence(*impl_, rrec.value, "worker died");
-    }
+    // reservations are fenced too; earlier incarnations were fenced when
+    // they were superseded).
+    impl_->fenceIncarnationLocked(w, boot, "worker died");
     return Result<void>::success();
 }
 

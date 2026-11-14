@@ -37,7 +37,6 @@ struct RegionRecord {
     std::uint64_t latencyNs = 0;
     std::uint64_t bandwidthBytesPerSec = 0;
     std::vector<AttachmentEvidence> attachments;
-    std::vector<std::pair<PoolId, PoolGeneration>> poolMemberships;
     std::uint64_t evidenceAtMs = 0;
 };
 
@@ -60,6 +59,7 @@ struct ReservationRecord {
 
 struct WorkerRecord {
     WorkerBootId boot;
+    std::vector<WorkerBootId> priorBoots;   // superseded incarnations, never re-admitted
     CoordinatorEpoch registeredEpoch;
     std::uint64_t pid = 0;
     bool alive = false;
@@ -103,6 +103,11 @@ struct Fabric::Impl {
     // Returns true if the reservation was newly fenced/cancelled, false if the
     // ledger could not be adjusted (should not happen given invariants).
     static bool fence(Impl& st, Reservation& r, const char* reason);
+
+    // Revoke one worker incarnation's dynamic authority: evidence it published
+    // and every reservation bound to it or backed by that evidence (stateMtx
+    // held unique).
+    void fenceIncarnationLocked(const WorkerId& w, const WorkerBootId& boot, const char* reason);
 
     // Shared selection core: eligibility + deterministic ranking. No locking
     // (caller holds stateMtx, shared or unique). Mints a fresh selection id.

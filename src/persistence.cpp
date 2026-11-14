@@ -1,4 +1,5 @@
 #include "fabric_impl.hpp"
+#include <array>
 #include <fstream>
 #include <vector>
 #include <cstring>
@@ -21,17 +22,17 @@ constexpr std::uint8_t kMagic[4]    = {'M', 'E', 'F', 'P'};
 
 // --- CRC-32 (IEEE 802.3) -------------------------------------------------
 std::uint32_t crc32(const std::uint8_t* data, std::size_t len) {
-    static std::uint32_t table[256];
-    static bool init = false;
-    if (!init) {
+    // Initialized once, thread-safely (concurrent saves/loads share it).
+    static const std::array<std::uint32_t, 256> table = [] {
+        std::array<std::uint32_t, 256> t{};
         for (std::uint32_t i = 0; i < 256; ++i) {
             std::uint32_t c = i;
             for (int k = 0; k < 8; ++k)
                 c = (c & 1) ? (0xEDB88320u ^ (c >> 1)) : (c >> 1);
-            table[i] = c;
+            t[i] = c;
         }
-        init = true;
-    }
+        return t;
+    }();
     std::uint32_t crc = 0xFFFFFFFFu;
     for (std::size_t i = 0; i < len; ++i)
         crc = table[(crc ^ data[i]) & 0xFFu] ^ (crc >> 8);
@@ -358,15 +359,6 @@ Result<Fabric> Fabric::load(const std::string& path) {
         return Result<Fabric>::fail(ErrorCode::CORRUPT, "payload: " + err);
     std::uint64_t persistedEpoch = f.impl_->epoch.value();
     f.impl_->epoch = CoordinatorEpoch(persistedEpoch + 1);
-
-    // Rebuild pool-member reverse index on regions.
-    for (const auto& [pid, pl] : f.impl_->pools) {
-        for (const auto& m : pl.descriptor.members) {
-            auto rit = f.impl_->regions.find(m.region);
-            if (rit != f.impl_->regions.end())
-                rit->second.poolMemberships.push_back({pid, pl.descriptor.generation});
-        }
-    }
     return Result<Fabric>::ok(std::move(f));
 }
 

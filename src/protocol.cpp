@@ -1,4 +1,5 @@
 #include "memory_expansion_fabric/protocol.hpp"
+#include <array>
 #include <cstring>
 #include <cstdint>
 
@@ -11,16 +12,16 @@ constexpr std::uint32_t kMaxCount = 8192u;
 constexpr std::uint32_t kMaxString = 1024u;
 
 std::uint32_t crc32(const std::uint8_t* data, std::size_t len) {
-    static std::uint32_t table[256];
-    static bool init = false;
-    if (!init) {
+    // Initialized once, thread-safely (connection threads decode concurrently).
+    static const std::array<std::uint32_t, 256> table = [] {
+        std::array<std::uint32_t, 256> t{};
         for (std::uint32_t i = 0; i < 256; ++i) {
             std::uint32_t c = i;
             for (int k = 0; k < 8; ++k) c = (c & 1) ? (0xEDB88320u ^ (c >> 1)) : (c >> 1);
-            table[i] = c;
+            t[i] = c;
         }
-        init = true;
-    }
+        return t;
+    }();
     std::uint32_t crc = 0xFFFFFFFFu;
     for (std::size_t i = 0; i < len; ++i) crc = table[(crc ^ data[i]) & 0xFFu] ^ (crc >> 8);
     return crc ^ 0xFFFFFFFFu;

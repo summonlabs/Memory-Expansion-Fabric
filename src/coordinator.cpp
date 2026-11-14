@@ -38,8 +38,12 @@ struct Coordinator {
     std::uint64_t port = 0;
     std::string workerExe;
     mef::CoordinatorEpoch epoch;
+    // The process this coordinator spawned for each worker id (at most one at
+    // a time) and the boot it was spawned with. Guarded by procMtx, which is
+    // always taken before the fabric's own lock.
+    struct Spawned { HANDLE handle; mef::WorkerBootId boot; };
     std::mutex procMtx;
-    std::map<mef::WorkerId, HANDLE> procHandles;
+    std::map<mef::WorkerId, Spawned> procHandles;
     std::mutex sendMtx;
 
     explicit Coordinator(mef::CoordinatorEpoch e) : fabric(e), epoch(e) {}
@@ -133,16 +137,28 @@ bool spawnWorker(CoordPtr c, mef::WorkerId w, mef::WorkerBootId boot, HANDLE& ou
     return true;
 }
 
-void workerMonitor(CoordPtr c, mef::WorkerId w, HANDLE h) {
+bool processRunning(HANDLE h) {
+#ifdef _WIN32
+    return ::WaitForSingleObject(h, 0) == WAIT_TIMEOUT;
+#else
+    (void)h;
+    return false;
+#endif
+}
+
+void workerMonitor(CoordPtr c, mef::WorkerId w, mef::WorkerBootId boot, HANDLE h) {
 #ifdef _WIN32
     ::WaitForSingleObject(h, INFINITE);   // blocks until the child exits
-    mef::Authority auth(c->epoch);
-    c->fabric.markWorkerDead(w, auth);
     std::lock_guard<std::mutex> lk(c->procMtx);
-    c->procHandles.erase(w);
+    // The exit proves the death of this incarnation only: under its own
+    // authority the call is refused once a newer boot has taken over.
+    mef::Authority auth(c->epoch, w, boot);
+    c->fabric.markWorkerDead(w, auth);
+    auto it = c->procHandles.find(w);
+    if (it != c->procHandles.end() && it->second.handle == h) c->procHandles.erase(it);
     ::CloseHandle(h);
 #else
-    (void)c; (void)w; (void)h;
+    (void)c; (void)w; (void)boot; (void)h;
 #endif
 }
 
@@ -178,14 +194,28 @@ void handleConnection(CoordPtr c, SOCK s) {
             switch (frame.type) {
                 case mef::FrameType::HELLO: {
                     // payload: worker(u64) boot(u64) epoch(u64) pid(u64)
-                    if (frame.payload.size() < 32) break;
+                    if (frame.payload.size() < 32) {
+                        sendFrame(c, s, mef::FrameType::HELLO_ACK, std::vector<std::uint8_t>{0});
+                        break;
+                    }
                     auto rd = [&](std::size_t off){ return memefle64(frame.payload.data()+off); };
                     worker = mef::WorkerId(rd(0)); boot = mef::WorkerBootId(rd(8));
                     mef::CoordinatorEpoch ep = mef::CoordinatorEpoch(rd(16));
                     std::uint64_t pid = rd(24);
-                    mef::Authority a(c->epoch);
-                    auto r = c->fabric.registerWorker(worker, boot, ep, pid, a);
-                    isWorker = r.ok();
+                    bool admitted = false;
+                    {
+                        // Only an incarnation this coordinator spawned, whose
+                        // process is still running, registers: its process
+                        // handle is the only proof of its death.
+                        std::lock_guard<std::mutex> lk(c->procMtx);
+                        auto it = c->procHandles.find(worker);
+                        if (it != c->procHandles.end() && it->second.boot == boot &&
+                            processRunning(it->second.handle)) {
+                            mef::Authority a(c->epoch);
+                            admitted = c->fabric.registerWorker(worker, boot, ep, pid, a).ok();
+                        }
+                    }
+                    isWorker = admitted;
                     if (isWorker) { c->fabric.noteWorkerHandle(worker, true); }
                     std::vector<std::uint8_t> ack;
                     ack.push_back(isWorker ? 1 : 0);
@@ -201,44 +231,53 @@ void handleConnection(CoordPtr c, SOCK s) {
                     }
                     break;
                 }
+                // Every request is answered; a rejected SELECT or COMMIT gets an
+                // empty payload, which does not decode, instead of silence that
+                // would leave the client waiting forever.
                 case mef::FrameType::SELECT: {
+                    std::vector<std::uint8_t> resp;
                     auto req = mef::decodeRequirements(frame.payload);
                     if (req.ok()) {
                         mef::Authority a(c->epoch);
                         auto sel = c->fabric.select(req.value(), a);
-                        if (sel.ok())
-                            sendFrame(c, s, mef::FrameType::SELECT_RESP,
-                                      mef::encodeSelection(sel.value()).value());
+                        if (sel.ok()) resp = mef::encodeSelection(sel.value()).value();
                     }
+                    sendFrame(c, s, mef::FrameType::SELECT_RESP, resp);
                     break;
                 }
                 case mef::FrameType::RESERVE: {
+                    std::vector<std::uint8_t> resp;
                     auto req = mef::decodeRequirements(frame.payload);
                     if (req.ok()) {
                         mef::Authority a(c->epoch);
                         auto rres = c->fabric.requestReservation(req.value(), a);
-                        std::vector<std::uint8_t> resp;
                         resp.push_back(rres.ok() ? 1 : 0);
                         if (rres.ok()) {
                             std::uint64_t idv = rres.value().value();
                             for (int i = 0; i < 8; ++i) resp.push_back((idv >> (8*i)) & 0xFFu);
                         }
-                        sendFrame(c, s, mef::FrameType::RESERVE_RESP, resp);
+                    } else {
+                        resp.push_back(0);
                     }
+                    sendFrame(c, s, mef::FrameType::RESERVE_RESP, resp);
                     break;
                 }
                 case mef::FrameType::COMMIT: {
-                    if (frame.payload.size() < 8) break;
-                    mef::ReservationId id = mef::ReservationId(memefle64(frame.payload.data()));
-                    mef::Authority a(c->epoch);
-                    auto res = c->fabric.commitReservation(id, a);
-                    if (res.ok())
-                        sendFrame(c, s, mef::FrameType::COMMIT_RESP,
-                                  mef::encodeReservation(res.value()).value());
+                    std::vector<std::uint8_t> resp;
+                    if (frame.payload.size() >= 8) {
+                        mef::ReservationId id = mef::ReservationId(memefle64(frame.payload.data()));
+                        mef::Authority a(c->epoch);
+                        auto res = c->fabric.commitReservation(id, a);
+                        if (res.ok()) resp = mef::encodeReservation(res.value()).value();
+                    }
+                    sendFrame(c, s, mef::FrameType::COMMIT_RESP, resp);
                     break;
                 }
                 case mef::FrameType::RELEASE: {
-                    if (frame.payload.size() < 8) break;
+                    if (frame.payload.size() < 8) {
+                        sendFrame(c, s, mef::FrameType::RELEASE_RESP, std::vector<std::uint8_t>{0});
+                        break;
+                    }
                     mef::ReservationId id = mef::ReservationId(memefle64(frame.payload.data()));
                     mef::Authority a(c->epoch);
                     auto res = c->fabric.releaseReservation(id, a);
@@ -280,35 +319,47 @@ void handleConnection(CoordPtr c, SOCK s) {
                     break;
                 }
                 case mef::FrameType::SPAWN_WORKER: {
-                    if (frame.payload.size() < 16) break;
+                    if (frame.payload.size() < 16) {
+                        sendFrame(c, s, mef::FrameType::SPAWN_WORKER_RESP, std::vector<std::uint8_t>{0});
+                        break;
+                    }
                     mef::WorkerId w = mef::WorkerId(memefle64(frame.payload.data()));
                     mef::WorkerBootId b = mef::WorkerBootId(memefle64(frame.payload.data()+8));
                     HANDLE h = nullptr;
-                    bool ok = spawnWorker(c, w, b, h);
-                    if (ok) {
-                        {
-                            std::lock_guard<std::mutex> lk(c->procMtx);
-                            c->procHandles[w] = h;
+                    bool ok = false;
+                    {
+                        // One process per worker id: replacing the handle of a
+                        // running one would leave it unterminable, and its exit
+                        // would be taken for the newer incarnation's death. The
+                        // lock is held until the handle is recorded, so the
+                        // child's HELLO finds its incarnation.
+                        std::lock_guard<std::mutex> lk(c->procMtx);
+                        auto it = c->procHandles.find(w);
+                        if (it == c->procHandles.end() || !processRunning(it->second.handle)) {
+                            ok = spawnWorker(c, w, b, h);
+                            if (ok) c->procHandles[w] = Coordinator::Spawned{h, b};
                         }
-                        std::thread(workerMonitor, c, w, h).detach();
                     }
+                    if (ok) std::thread(workerMonitor, c, w, b, h).detach();
                     std::vector<std::uint8_t> resp; resp.push_back(ok ? 1 : 0);
                     sendFrame(c, s, mef::FrameType::SPAWN_WORKER_RESP, resp);
                     break;
                 }
                 case mef::FrameType::TERMINATE_WORKER: {
-                    if (frame.payload.size() < 8) break;
+                    if (frame.payload.size() < 8) {
+                        sendFrame(c, s, mef::FrameType::TERMINATE_WORKER_RESP, std::vector<std::uint8_t>{0});
+                        break;
+                    }
                     mef::WorkerId w = mef::WorkerId(memefle64(frame.payload.data()));
-                    HANDLE h = nullptr;
+                    bool killed = false;
                     {
+                        // Terminate under the lock: the monitor closes the
+                        // handle under the same lock.
                         std::lock_guard<std::mutex> lk(c->procMtx);
                         auto it = c->procHandles.find(w);
-                        if (it != c->procHandles.end()) h = it->second;
-                    }
-                    bool killed = false;
-                    if (h != nullptr) {
 #ifdef _WIN32
-                        killed = ::TerminateProcess(h, 1) != 0;
+                        if (it != c->procHandles.end())
+                            killed = ::TerminateProcess(it->second.handle, 1) != 0;
 #endif
                     }
                     std::vector<std::uint8_t> resp; resp.push_back(killed ? 1 : 0);
@@ -411,7 +462,9 @@ int runCoordinator(int argc, char** argv) {
     sockaddr_in addr{};
     addr.sin_family = AF_INET;
     addr.sin_port = htons((u_short)port);
-    addr.sin_addr.s_addr = INADDR_ANY;
+    // Loopback only: the control plane (worker spawn/terminate, SAVE to a
+    // client-named path, reservations) is unauthenticated.
+    addr.sin_addr.s_addr = htonl(INADDR_LOOPBACK);
     if (::bind(ls, (sockaddr*)&addr, sizeof(addr)) == SOCKET_ERROR) {
         std::printf("coordinator: bind failed %d\n", ::WSAGetLastError()); return 1;
     }
